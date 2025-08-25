@@ -44,10 +44,14 @@ async function spawnCursor(command, options = {}, ws) {
       args.push('--output-format', 'stream-json');
     }
     
-    // Add skip permissions flag if enabled
-    if (skipPermissions || settings.skipPermissions) {
+    // Add skip permissions flag if enabled (check env var, parameter, or settings)
+    const yoloModeEnabled = process.env.YOLO_MODE === 'true' || skipPermissions || settings.skipPermissions;
+    if (yoloModeEnabled) {
       args.push('-f');
-      console.log('⚠️  Using -f flag (skip permissions)');
+      let source = 'UI settings';
+      if (process.env.YOLO_MODE === 'true') source = 'YOLO_MODE env var';
+      else if (skipPermissions) source = 'parameter';
+      console.log(`⚠️  Using -f flag (skip permissions from ${source})`);
     }
     
     // Use cwd (actual project directory) instead of projectPath

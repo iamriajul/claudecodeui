@@ -182,10 +182,14 @@ async function spawnClaude(command, options = {}, ws) {
     }
     
     // Add tools settings flags
+    // Check for YOLO mode from environment variable or settings
+    const yoloModeEnabled = process.env.YOLO_MODE === 'true' || settings.skipPermissions;
+    
     // Don't use --dangerously-skip-permissions when in plan mode
-    if (settings.skipPermissions && permissionMode !== 'plan') {
+    if (yoloModeEnabled && permissionMode !== 'plan') {
       args.push('--dangerously-skip-permissions');
-      console.log('⚠️  Using --dangerously-skip-permissions (skipping other tool settings)');
+      const source = process.env.YOLO_MODE === 'true' ? '(from YOLO_MODE env var)' : '(from UI settings)';
+      console.log(`⚠️  Using --dangerously-skip-permissions ${source} - skipping other tool settings`);
     } else {
       // Only add allowed/disallowed tools if not skipping permissions
       
@@ -221,8 +225,9 @@ async function spawnClaude(command, options = {}, ws) {
       }
       
       // Log when skip permissions is disabled due to plan mode
-      if (settings.skipPermissions && permissionMode === 'plan') {
-        console.log('📝 Skip permissions disabled due to plan mode');
+      if (yoloModeEnabled && permissionMode === 'plan') {
+        const source = process.env.YOLO_MODE === 'true' ? 'YOLO_MODE env var' : 'UI settings';
+        console.log(`📝 Skip permissions (${source}) disabled due to plan mode`);
       }
     }
     
