@@ -12,6 +12,7 @@ function ToolsSettings({ isOpen, onClose, projects = [] }) {
   const [newAllowedTool, setNewAllowedTool] = useState('');
   const [newDisallowedTool, setNewDisallowedTool] = useState('');
   const [skipPermissions, setSkipPermissions] = useState(false);
+  const [yoloModeFromEnv, setYoloModeFromEnv] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
   const [projectSortOrder, setProjectSortOrder] = useState('name');
@@ -330,6 +331,23 @@ function ToolsSettings({ isOpen, onClose, projects = [] }) {
         setDisallowedTools([]);
         setSkipPermissions(false);
         setProjectSortOrder('name');
+      }
+      
+      // Check for YOLO mode from server config
+      try {
+        const configResponse = await fetch('/api/config', {
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+        if (configResponse.ok) {
+          const config = await configResponse.json();
+          setYoloModeFromEnv(config.yoloModeEnabled || false);
+        }
+      } catch (error) {
+        console.warn('Failed to fetch config:', error);
+        setYoloModeFromEnv(false);
       }
       
       // Load Cursor settings from localStorage
@@ -753,14 +771,25 @@ function ToolsSettings({ isOpen, onClose, projects = [] }) {
                     type="checkbox"
                     checked={skipPermissions}
                     onChange={(e) => setSkipPermissions(e.target.checked)}
-                    className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500"
+                    disabled={yoloModeFromEnv}
+                    className="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500 disabled:opacity-50"
                   />
                   <div>
                     <div className="font-medium text-orange-900 dark:text-orange-100">
                       Skip permission prompts (use with caution)
+                      {yoloModeFromEnv && (
+                        <Badge variant="secondary" className="ml-2 bg-orange-200 dark:bg-orange-800 text-orange-800 dark:text-orange-200">
+                          ENV
+                        </Badge>
+                      )}
                     </div>
                     <div className="text-sm text-orange-700 dark:text-orange-300">
                       Equivalent to --dangerously-skip-permissions flag
+                      {yoloModeFromEnv && (
+                        <div className="mt-1 text-orange-600 dark:text-orange-400 font-medium">
+                          ⚠️ YOLO mode is enabled via YOLO_MODE environment variable
+                        </div>
+                      )}
                     </div>
                   </div>
                 </label>

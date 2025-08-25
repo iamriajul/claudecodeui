@@ -203,7 +203,8 @@ app.get('/api/config', authenticateToken, (req, res) => {
 
     res.json({
         serverPort: PORT,
-        wsUrl: `${protocol}://${host}`
+        wsUrl: `${protocol}://${host}`,
+        yoloModeEnabled: process.env.YOLO_MODE === 'true'
     });
 });
 
