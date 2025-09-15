@@ -66,6 +66,134 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import os from 'os';
 
+// Import TaskMaster detection functions
+async function detectTaskMasterFolder(projectPath) {
+    try {
+        const taskMasterPath = path.join(projectPath, '.taskmaster');
+        
+        // Check if .taskmaster directory exists
+        try {
+            const stats = await fs.stat(taskMasterPath);
+            if (!stats.isDirectory()) {
+                return {
+                    hasTaskmaster: false,
+                    reason: '.taskmaster exists but is not a directory'
+                };
+            }
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return {
+                    hasTaskmaster: false,
+                    reason: '.taskmaster directory not found'
+                };
+            }
+            throw error;
+        }
+
+        // Check for key TaskMaster files
+        const keyFiles = [
+            'tasks/tasks.json',
+            'config.json'
+        ];
+        
+        const fileStatus = {};
+        let hasEssentialFiles = true;
+
+        for (const file of keyFiles) {
+            const filePath = path.join(taskMasterPath, file);
+            try {
+                await fs.access(filePath);
+                fileStatus[file] = true;
+            } catch (error) {
+                fileStatus[file] = false;
+                if (file === 'tasks/tasks.json') {
+                    hasEssentialFiles = false;
+                }
+            }
+        }
+
+        // Parse tasks.json if it exists for metadata
+        let taskMetadata = null;
+        if (fileStatus['tasks/tasks.json']) {
+            try {
+                const tasksPath = path.join(taskMasterPath, 'tasks/tasks.json');
+                const tasksContent = await fs.readFile(tasksPath, 'utf8');
+                const tasksData = JSON.parse(tasksContent);
+                
+                // Handle both tagged and legacy formats
+                let tasks = [];
+                if (tasksData.tasks) {
+                    // Legacy format
+                    tasks = tasksData.tasks;
+                } else {
+                    // Tagged format - get tasks from all tags
+                    Object.values(tasksData).forEach(tagData => {
+                        if (tagData.tasks) {
+                            tasks = tasks.concat(tagData.tasks);
+                        }
+                    });
+                }
+
+                // Calculate task statistics
+                const stats = tasks.reduce((acc, task) => {
+                    acc.total++;
+                    acc[task.status] = (acc[task.status] || 0) + 1;
+                    
+                    // Count subtasks
+                    if (task.subtasks) {
+                        task.subtasks.forEach(subtask => {
+                            acc.subtotalTasks++;
+                            acc.subtasks = acc.subtasks || {};
+                            acc.subtasks[subtask.status] = (acc.subtasks[subtask.status] || 0) + 1;
+                        });
+                    }
+                    
+                    return acc;
+                }, { 
+                    total: 0, 
+                    subtotalTasks: 0,
+                    pending: 0, 
+                    'in-progress': 0, 
+                    done: 0, 
+                    review: 0,
+                    deferred: 0,
+                    cancelled: 0,
+                    subtasks: {}
+                });
+
+                taskMetadata = {
+                    taskCount: stats.total,
+                    subtaskCount: stats.subtotalTasks,
+                    completed: stats.done || 0,
+                    pending: stats.pending || 0,
+                    inProgress: stats['in-progress'] || 0,
+                    review: stats.review || 0,
+                    completionPercentage: stats.total > 0 ? Math.round((stats.done / stats.total) * 100) : 0,
+                    lastModified: (await fs.stat(tasksPath)).mtime.toISOString()
+                };
+            } catch (parseError) {
+                console.warn('Failed to parse tasks.json:', parseError.message);
+                taskMetadata = { error: 'Failed to parse tasks.json' };
+            }
+        }
+
+        return {
+            hasTaskmaster: true,
+            hasEssentialFiles,
+            files: fileStatus,
+            metadata: taskMetadata,
+            path: taskMasterPath
+        };
+
+    } catch (error) {
+        console.error('Error detecting TaskMaster folder:', error);
+        return {
+            hasTaskmaster: false,
+            reason: `Error checking directory: ${error.message}`
+        };
+    }
+}
+
 // Cache for extracted project directories
 const projectDirectoryCache = new Map();
 
@@ -298,6 +426,25 @@ async function getProjects() {
           project.cursorSessions = [];
         }
         
+        // Add TaskMaster detection
+        try {
+          const taskMasterResult = await detectTaskMasterFolder(actualProjectDir);
+          project.taskmaster = {
+            hasTaskmaster: taskMasterResult.hasTaskmaster,
+            hasEssentialFiles: taskMasterResult.hasEssentialFiles,
+            metadata: taskMasterResult.metadata,
+            status: taskMasterResult.hasTaskmaster && taskMasterResult.hasEssentialFiles ? 'configured' : 'not-configured'
+          };
+        } catch (e) {
+          console.warn(`Could not detect TaskMaster for project ${entry.name}:`, e.message);
+          project.taskmaster = {
+            hasTaskmaster: false,
+            hasEssentialFiles: false,
+            metadata: null,
+            status: 'error'
+          };
+        }
+        
         projects.push(project);
       }
     }
@@ -341,6 +488,32 @@ async function getProjects() {
         console.warn(`Could not load Cursor sessions for manual project ${projectName}:`, e.message);
       }
       
+      // Add TaskMaster detection for manual projects
+      try {
+        const taskMasterResult = await detectTaskMasterFolder(actualProjectDir);
+        
+        // Determine TaskMaster status
+        let taskMasterStatus = 'not-configured';
+        if (taskMasterResult.hasTaskmaster && taskMasterResult.hasEssentialFiles) {
+          taskMasterStatus = 'taskmaster-only'; // We don't check MCP for manual projects in bulk
+        }
+        
+        project.taskmaster = {
+          status: taskMasterStatus,
+          hasTaskmaster: taskMasterResult.hasTaskmaster,
+          hasEssentialFiles: taskMasterResult.hasEssentialFiles,
+          metadata: taskMasterResult.metadata
+        };
+      } catch (error) {
+        console.warn(`TaskMaster detection failed for manual project ${projectName}:`, error.message);
+        project.taskmaster = {
+          status: 'error',
+          hasTaskmaster: false,
+          hasEssentialFiles: false,
+          error: error.message
+        };
+      }
+      
       projects.push(project);
     }
   }
@@ -359,7 +532,7 @@ async function getSessions(projectName, limit = 5, offset = 0) {
       return { sessions: [], hasMore: false, total: 0 };
     }
     
-    // For performance, get file stats to sort by modification time
+    // Sort files by modification time (newest first)
     const filesWithStats = await Promise.all(
       jsonlFiles.map(async (file) => {
         const filePath = path.join(projectDir, file);
@@ -367,40 +540,84 @@ async function getSessions(projectName, limit = 5, offset = 0) {
         return { file, mtime: stats.mtime };
       })
     );
-    
-    // Sort files by modification time (newest first) for better performance
     filesWithStats.sort((a, b) => b.mtime - a.mtime);
     
     const allSessions = new Map();
-    let processedCount = 0;
+    const allEntries = [];
+    const uuidToSessionMap = new Map();
     
-    // Process files in order of modification time
+    // Collect all sessions and entries from all files
     for (const { file } of filesWithStats) {
       const jsonlFile = path.join(projectDir, file);
-      const sessions = await parseJsonlSessions(jsonlFile);
+      const result = await parseJsonlSessions(jsonlFile);
       
-      // Merge sessions, avoiding duplicates by session ID
-      sessions.forEach(session => {
+      result.sessions.forEach(session => {
         if (!allSessions.has(session.id)) {
           allSessions.set(session.id, session);
         }
       });
       
-      processedCount++;
+      allEntries.push(...result.entries);
       
-      // Early exit optimization: if we have enough sessions and processed recent files
-      if (allSessions.size >= (limit + offset) * 2 && processedCount >= Math.min(3, filesWithStats.length)) {
+      // Early exit optimization for large projects
+      if (allSessions.size >= (limit + offset) * 2 && allEntries.length >= Math.min(3, filesWithStats.length)) {
         break;
       }
     }
     
-    // Convert to array and sort by last activity
-    const sortedSessions = Array.from(allSessions.values()).sort((a, b) => 
-      new Date(b.lastActivity) - new Date(a.lastActivity)
-    );
+    // Build UUID-to-session mapping for timeline detection
+    allEntries.forEach(entry => {
+      if (entry.uuid && entry.sessionId) {
+        uuidToSessionMap.set(entry.uuid, entry.sessionId);
+      }
+    });
     
-    const total = sortedSessions.length;
-    const paginatedSessions = sortedSessions.slice(offset, offset + limit);
+    // Detect session continuations using leafUuid
+    const sessionContinuations = new Map();
+    let pendingContinuationInfo = null;
+    
+    allEntries.forEach(entry => {
+      // Summary entries without sessionId indicate a session continuation
+      if (entry.type === 'summary' && !entry.sessionId && (entry.leafUuid || entry.leafUUID)) {
+        pendingContinuationInfo = {
+          leafUuid: entry.leafUuid || entry.leafUUID,
+          summary: entry.summary || 'Continued Session'
+        };
+        return;
+      }
+      
+      if (entry.sessionId) {
+        const session = allSessions.get(entry.sessionId);
+        
+        // Apply pending continuation info
+        if (session && pendingContinuationInfo) {
+          const previousSession = uuidToSessionMap.get(pendingContinuationInfo.leafUuid);
+          if (previousSession) {
+            session.summary = pendingContinuationInfo.summary;
+            sessionContinuations.set(entry.sessionId, previousSession);
+          }
+          pendingContinuationInfo = null;
+        }
+        
+        // Handle summary entries with sessionId that have leafUuid
+        if (entry.type === 'summary' && (entry.leafUuid || entry.leafUUID)) {
+          const leafUuid = entry.leafUuid || entry.leafUUID;
+          const previousSession = uuidToSessionMap.get(leafUuid);
+          if (previousSession && session) {
+            sessionContinuations.set(entry.sessionId, previousSession);
+          }
+        }
+      }
+    });
+    
+    // Filter out continued sessions - only show the latest in each timeline
+    const continuedSessions = new Set(sessionContinuations.values());
+    const visibleSessions = Array.from(allSessions.values())
+      .filter(session => !continuedSessions.has(session.id))
+      .sort((a, b) => new Date(b.lastActivity) - new Date(a.lastActivity));
+    
+    const total = visibleSessions.length;
+    const paginatedSessions = visibleSessions.slice(offset, offset + limit);
     const hasMore = offset + limit < total;
     
     return {
@@ -418,6 +635,7 @@ async function getSessions(projectName, limit = 5, offset = 0) {
 
 async function parseJsonlSessions(filePath) {
   const sessions = new Map();
+  const entries = [];
   
   try {
     const fileStream = fsSync.createReadStream(filePath);
@@ -426,14 +644,11 @@ async function parseJsonlSessions(filePath) {
       crlfDelay: Infinity
     });
     
-    // console.log(`[JSONL Parser] Reading file: ${filePath}`);
-    let lineCount = 0;
-    
     for await (const line of rl) {
       if (line.trim()) {
-        lineCount++;
         try {
           const entry = JSON.parse(line);
+          entries.push(entry);
           
           if (entry.sessionId) {
             if (!sessions.has(entry.sessionId)) {
@@ -448,43 +663,37 @@ async function parseJsonlSessions(filePath) {
             
             const session = sessions.get(entry.sessionId);
             
-            // Update summary if this is a summary entry
+            // Update summary from summary entries or first user message
             if (entry.type === 'summary' && entry.summary) {
               session.summary = entry.summary;
             } else if (entry.message?.role === 'user' && entry.message?.content && session.summary === 'New Session') {
-              // Use first user message as summary if no summary entry exists
               const content = entry.message.content;
-              if (typeof content === 'string' && content.length > 0) {
-                // Skip command messages that start with <command-name>
-                if (!content.startsWith('<command-name>')) {
-                  session.summary = content.length > 50 ? content.substring(0, 50) + '...' : content;
-                }
+              if (typeof content === 'string' && content.length > 0 && !content.startsWith('<command-name>')) {
+                session.summary = content.length > 50 ? content.substring(0, 50) + '...' : content;
               }
             }
             
-            // Count messages instead of storing them all
-            session.messageCount = (session.messageCount || 0) + 1;
+            session.messageCount++;
             
-            // Update last activity
             if (entry.timestamp) {
               session.lastActivity = new Date(entry.timestamp);
             }
           }
         } catch (parseError) {
-          console.warn(`[JSONL Parser] Error parsing line ${lineCount}:`, parseError.message);
+          // Skip malformed lines silently
         }
       }
     }
     
-    // console.log(`[JSONL Parser] Processed ${lineCount} lines, found ${sessions.size} sessions`);
+    return {
+      sessions: Array.from(sessions.values()),
+      entries: entries
+    };
+    
   } catch (error) {
     console.error('Error reading JSONL file:', error);
+    return { sessions: [], entries: [] };
   }
-  
-  // Convert Map to Array and sort by last activity
-  return Array.from(sessions.values()).sort((a, b) => 
-    new Date(b.lastActivity) - new Date(a.lastActivity)
-  );
 }
 
 // Get messages for a specific session with pagination support
